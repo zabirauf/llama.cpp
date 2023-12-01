@@ -650,6 +650,7 @@ struct llama_server_context
     }
 
     llama_client_slot* get_slot(int id) {
+        // ZR: This seems to find either the slot with the provided `id` or any available slot which was last used before now
         int64_t t_last = ggml_time_us();
         llama_client_slot *last_used = nullptr;
 
@@ -674,9 +675,12 @@ struct llama_server_context
         slot_params default_params;
         llama_sampling_params default_sparams;
 
+        // ZR: Gets the value from data or provided default
         slot->params.stream           = json_value(data, "stream",            false);
         slot->params.cache_prompt     = json_value(data, "cache_prompt",      false);
         slot->params.n_predict        = json_value(data, "n_predict",         default_params.n_predict);
+
+        // ZR: Sampling params
         slot->sparams.top_k           = json_value(data, "top_k",             default_sparams.top_k);
         slot->sparams.top_p           = json_value(data, "top_p",             default_sparams.top_p);
         slot->sparams.tfs_z           = json_value(data, "tfs_z",             default_sparams.tfs_z);
@@ -695,6 +699,7 @@ struct llama_server_context
         slot->sparams.grammar         = json_value(data, "grammar",           default_sparams.grammar);
         slot->sparams.n_probs         = json_value(data, "n_probs",           default_sparams.n_probs);
 
+        // ZR: `input_prefix` and `input_suffix` are JSON
         // infill
         if (data.count("input_prefix") != 0)
         {
@@ -716,6 +721,7 @@ struct llama_server_context
 
         if (data.count("prompt") != 0)
         {
+            // ZR: Important, here is where prompt is being set
             slot->prompt = data["prompt"];
         }
         else
@@ -723,19 +729,23 @@ struct llama_server_context
             slot->prompt = "";
         }
 
+        // ZR: Clear the logit_bias
         slot->sparams.logit_bias.clear();
 
         if (json_value(data, "ignore_eos", false))
         {
+            // ZR: Not sure why its -INFINITY as my understanding is that it means this will never be picked.
             slot->sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
         }
 
+        // ZR: Set logit_bias in sampling params
         const auto &logit_bias = data.find("logit_bias");
         if (logit_bias != data.end() && logit_bias->is_array())
         {
             const int n_vocab = llama_n_vocab(model);
             for (const auto &el : *logit_bias)
             {
+                // ZR: If logit_bias is an array of array [[token_id, token_logit_bias], [token_id, false | true]] where false == -INFINITY
                 if (el.is_array() && el.size() == 2 && el[0].is_number_integer())
                 {
                     llama_token tok = el[0].get<llama_token>();
@@ -754,6 +764,7 @@ struct llama_server_context
             }
         }
 
+        // ZR: I think antiprompt are likely the stop strings
         slot->params.antiprompt.clear();
 
         const auto &stop = data.find("stop");
@@ -768,6 +779,7 @@ struct llama_server_context
             }
         }
 
+        // ZR: For the time being I'm going to just skip the multimodal
         if (multimodal)
         {
             const auto &images_data = data.find("image_data");
@@ -842,11 +854,15 @@ struct llama_server_context
             }
         }
 
+        // ZR: I think the ctx_sampling is for the grammar
         if (slot->ctx_sampling != nullptr)
         {
             llama_sampling_free(slot->ctx_sampling);
         }
         slot->ctx_sampling = llama_sampling_init(slot->sparams);
+
+
+        // ZR: Load the prompt and set that slots are not idle, given we just setup one.
         slot->command = LOAD_PROMPT;
 
         all_slots_are_idle = false;
@@ -1368,22 +1384,33 @@ struct llama_server_context
         std::lock_guard<std::mutex> lock(mutex_tasks);
         while (!queue_tasks.empty())
         {
+            // ZR: Pop task from queue
             task_server task = queue_tasks.front();
             queue_tasks.erase(queue_tasks.begin());
+
+            // ZR: Task are either CompletionTask or CancelTask
             switch (task.type)
             {
                 case COMPLETION_TASK: {
-                    llama_client_slot *slot = get_slot(json_value(task.data, "slot_id", -1));
+                    // ZR: Slot is a unit of parallelization/work in this code
+                    // ZR: TODO: Not sure why the task itself contains the slot_id instead of figuring out slot_id based on which one is free
+                    // ZR: This access task.data["slot_id"]
+                    llama_client_slot *slot = get_slot(json_value(task.data, "slot_id", -1 /* default_value */));
                     if (slot == nullptr)
                     {
                         LOG_TEE("slot unavailable\n");
                         // send error result
+                        // ZR: This queues up an error result in `queue_result`
                         send_error(task.id, "slot unavailable");
                         return;
                     }
 
                     if (task.data.contains("system_prompt"))
                     {
+                        // ZR: "system_prompt" contains .prompt, .anti_prompt, .assistant_name
+                        // ZR: TODO: Not sure what is `anti_prompt`
+                        // ZR: Seems like `anti_prompt` is `name_user`
+                        // ZR: This also seems to release every slot by issuing command = RELEASE
                         process_system_prompt_data(task.data["system_prompt"]);
                     }
 
@@ -1391,6 +1418,8 @@ struct llama_server_context
 
                     slot->infill = task.infill_mode;
                     slot->embedding = task.embedding_mode;
+
+                    // ZR: Interesting that it assigns the task_id based on passed in task, so it seems like id is not self configured in slot and keeps on changing
                     slot->task_id = task.id;
 
                     if (!launch_slot_with_data(slot, task.data))
@@ -1438,6 +1467,7 @@ struct llama_server_context
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
 
+        // ZR: Looks like this is where slots processing/running happens
         for (llama_client_slot &slot : slots)
         {
             if (slot.is_processing() && slot.cache_tokens.size() >= (size_t) slot.n_ctx)
@@ -1525,6 +1555,7 @@ struct llama_server_context
                     slot.t_start_process_prompt = ggml_time_us();
                     slot.t_start_genereration = 0;
 
+                    // ZR: I think infill is maybe generation that is in the middle e.g. prefix tokens {INFILL GENERATION} suffix tokens
                     if (slot.infill)
                     {
                         bool suff_rm_leading_spc = true;
@@ -1550,9 +1581,11 @@ struct llama_server_context
                     }
                     else
                     {
+                        // ZR: For just the basic we only need the following
                         prompt_tokens = tokenize(slot.prompt, system_prompt.empty());  // add BOS if there isn't system prompt
                     }
 
+                    // ZR: BOOKMARK: 11/08/2023
                     slot.num_prompt_tokens = prompt_tokens.size();
 
                     if (!slot.params.cache_prompt)
